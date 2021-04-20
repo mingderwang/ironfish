@@ -47,6 +47,7 @@ import {
   SerializedWasmNoteEncryptedHash,
   WasmNoteEncryptedHash,
 } from '../primitives/noteEncrypted'
+import { ChainDB } from './chaindb'
 
 export const GRAPH_ID_NULL = 0
 
@@ -66,35 +67,22 @@ export class Blockchain<
   SH extends JsonSerializable,
   ST
 > {
+  strategy: Strategy<E, H, T, SE, SH, ST>
+  verifier: Verifier<E, H, T, SE, SH, ST>
+  db: ChainDB<E, H, T, SE, SH, ST>
+  metrics: MetricsMonitor
+
   blockHeaderSerde: BlockHeaderSerde<E, H, T, SE, SH, ST>
-  blockHashSerde: BufferSerde
   noteSerde: Serde<E, SE>
+
   logger: Logger
   genesisBlockHash: BlockHash | null
   genesisHeader: BlockHeader<E, H, T, SE, SH, ST> | null
   looseNotes: { [key: number]: E }
   looseNullifiers: { [key: number]: Nullifier }
-  verifier: Verifier<E, H, T, SE, SH, ST>
 
-  // Block is a header + transactions
-  // (both are indexed by block hash)
-  headers: IDatabaseStore<HeadersSchema<SH>>
-  transactions: IDatabaseStore<TransactionsSchema<ST>>
-
-  // Given a sequence, return an array of blocks with that sequence
-  sequenceToHash: IDatabaseStore<SequenceToHashSchema>
-
-  // Given a hash, return an array of blocks pointing to it as previous
-  hashToNext: IDatabaseStore<HashToNextSchema>
-
-  graphs: IDatabaseStore<GraphSchema>
-
-  // Notes & Nullifiers Merkle Trees
   notes: MerkleTree<E, H, SE, SH>
   nullifiers: MerkleTree<Nullifier, NullifierHash, string, string>
-
-  // MetricsMonitor used to create and record performance metrics
-  metrics: MetricsMonitor
 
   onChainHeadChange = new Event<[hash: BlockHash]>()
 
@@ -110,15 +98,17 @@ export class Blockchain<
    * Construct a new Blockchain
    */
   private constructor(
-    readonly db: IDatabase,
-    readonly strategy: Strategy<E, H, T, SE, SH, ST>,
+    strategy: Strategy<E, H, T, SE, SH, ST>,
     notes: MerkleTree<E, H, SE, SH>,
     nullifiers: MerkleTree<Nullifier, NullifierHash, string, string>,
     logger: Logger,
     metrics: MetricsMonitor,
+    location: string,
   ) {
+    this.strategy = strategy
+    this.verifier = strategy.createVerifier(this)
+
     this.blockHeaderSerde = new BlockHeaderSerde(strategy)
-    this.blockHashSerde = BlockHashSerdeInstance
     this.noteSerde = notes.merkleHasher.elementSerde()
 
     this.logger = logger.withTag('blockchain')
@@ -130,42 +120,7 @@ export class Blockchain<
     this.looseNotes = {}
     this.looseNullifiers = {}
 
-    this.verifier = strategy.createVerifier(this)
-
-    this.headers = db.addStore({
-      version: SCHEMA_VERSION,
-      name: 'Headers',
-      keyEncoding: new BufferEncoding(), // block hash
-      valueEncoding: new JsonEncoding<SchemaValue<HeadersSchema<SH>>>(),
-    })
-
-    this.transactions = db.addStore({
-      version: SCHEMA_VERSION,
-      name: 'Transactions',
-      keyEncoding: new BufferEncoding(), // block hash
-      valueEncoding: new JsonEncoding<ST[]>(),
-    })
-
-    this.sequenceToHash = db.addStore({
-      version: SCHEMA_VERSION,
-      name: 'SequenceToHash',
-      keyEncoding: new StringEncoding(), // serialized bigint sequence
-      valueEncoding: new BufferArrayEncoding(), // array of block hashes
-    })
-
-    this.hashToNext = db.addStore({
-      version: SCHEMA_VERSION,
-      name: 'HashToNextHash',
-      keyEncoding: new BufferEncoding(), // serialized bigint sequence
-      valueEncoding: new BufferArrayEncoding(), // array of block hashes
-    })
-
-    this.graphs = db.addStore({
-      version: SCHEMA_VERSION,
-      name: 'Graphs',
-      keyEncoding: new StringEncoding(), // graph id
-      valueEncoding: new JsonEncoding<Graph>(),
-    })
+    this.db = new ChainDB({ location: location })
   }
 
   /**
@@ -730,7 +685,7 @@ export class Blockchain<
           const resolvedGraph = await this.resolveBlockGraph(hash, tx)
           Assert.isNotNull(resolvedGraph)
           const connectedToGenesis =
-            !!genesis && this.blockHashSerde.equals(resolvedGraph.tailHash, genesis)
+            !!genesis && BlockHashSerdeInstance.equals(resolvedGraph.tailHash, genesis)
 
           return {
             isAdded: true,
@@ -765,14 +720,14 @@ export class Blockchain<
         // GENESIS_BLOCK_PREVIOUS
         const addingGenesis =
           !genesis &&
-          this.blockHashSerde.equals(block.header.previousBlockHash, GENESIS_BLOCK_PREVIOUS)
+          BlockHashSerdeInstance.equals(block.header.previousBlockHash, GENESIS_BLOCK_PREVIOUS)
 
         // Adding to a genesis block chain? Or adding the genesis block itself?
         const addingToGenesis =
           addingGenesis ||
           (!!previousTail &&
             !!genesis &&
-            this.blockHashSerde.equals(previousTail.hash, genesis))
+            BlockHashSerdeInstance.equals(previousTail.hash, genesis))
 
         // Check if we can validate this block (blocks can only be fully validated if
         // they are valid *and* connected to genesis, so we check validation in case
@@ -850,7 +805,7 @@ export class Blockchain<
 
           Assert.isNotNull(resolved.heaviestHash)
 
-          isFastForward = this.blockHashSerde.equals(
+          isFastForward = BlockHashSerdeInstance.equals(
             previousBlockHeader.hash,
             resolved.heaviestHash,
           )
@@ -883,11 +838,11 @@ export class Blockchain<
         // did the heaviest block connecting to genesis change?
         const genesisHeaviestChanged =
           genesis &&
-          this.blockHashSerde.equals(resolved.tailHash, genesis) &&
+          BlockHashSerdeInstance.equals(resolved.tailHash, genesis) &&
           oldHeaviest &&
           resolved &&
           resolved.heaviestHash &&
-          !this.blockHashSerde.equals(oldHeaviest.hash, resolved.heaviestHash)
+          !BlockHashSerdeInstance.equals(oldHeaviest.hash, resolved.heaviestHash)
 
         await this.setBlock(block, tx)
         await this.setGraph(resolved, tx)
@@ -1096,7 +1051,7 @@ export class Blockchain<
     let currentBlock: Block<E, H, T, SE, SH, ST> | null = heaviestBlock
     while (
       currentBlock &&
-      !this.blockHashSerde.equals(currentBlock.header.hash, block.header.hash)
+      !BlockHashSerdeInstance.equals(currentBlock.header.hash, block.header.hash)
     ) {
       blocks.unshift(currentBlock)
       currentBlock = await this.getBlock(currentBlock.header.previousBlockHash, tx)
