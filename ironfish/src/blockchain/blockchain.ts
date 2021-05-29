@@ -1243,6 +1243,12 @@ export class Blockchain<
           nullifierIndex++
         }
       })
+
+      const verify = await this.verifier.blockMatchesTrees(block.header, tx)
+
+      if (!verify.valid) {
+        // TODO: throw error to abort, and change verify errors to exceptions
+      }
     })
   }
 
